@@ -1,0 +1,919 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{cleveref}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\definecolor{codegray}{gray}{0.96}
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  showstringspaces=false
+}
+\lstset{style=code}
+
+\newtheorem{definition}{Definition}
+\newtheorem{property}{Property}
+\newtheorem{remark}{Remark}
+
+\title{User-Defined Static Property Tags for Mainstream Programming Languages:\\
+A Lightweight Flow-Sensitive Verification Layer}
+\author{Sambuddha Majumder, Jayanta Majumder}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper proposes a lightweight static verification mechanism for mainstream programming languages in which program values may be associated, at compile time, with user-defined symbolic \emph{property tags}. A tag records a fact believed or proven about a value, such as \texttt{Validated}, \texttt{BoundsChecked}, \texttt{Authenticated}, \texttt{SQLSafe}, or \texttt{DeltaNeutral}. Programmers may introduce such properties at trusted proof points, require them at safety-critical program points, and specify interprocedural contracts describing how functions consume, preserve, invalidate, or establish properties. A flow-sensitive static checker propagates these facts over the control-flow and data-flow graphs and rejects code whenever a required property is not provable on every incoming path. The proposal intentionally occupies a design point between conventional static analysis and substantially more expressive systems such as refinement types, typestate, effect systems, abstract interpretation frameworks, and dependent type theory. Its principal aim is to expose correctness-relevant semantic state without requiring programmers to encode full logical predicates or construct explicit proofs. We present a core semantics, discuss positive, negative, and unknown property states, outline intraprocedural and interprocedural analyses, examine aliasing and mutation, propose syntax and contract forms, and analyse soundness, usability, expressiveness, and implementation strategies. Several extensions are considered, including parametric tags, capability-like tags, tag lattices, proof-producing validators, trust boundaries, generic tag transformers, and gradual adoption in existing languages.
+\end{abstract}
+
+\section{Introduction}
+Mainstream programming languages provide increasingly strong static guarantees about the \emph{shape} of values: their data types, nullability, generic parameters, ownership status, mutability, and in some cases lifetime relationships. Many important software correctness properties, however, are not naturally captured by conventional nominal or structural types. A string may be syntactically a \texttt{String} yet differ critically depending on whether it has been validated, normalised, authenticated, escaped for a particular output context, checked against an access-control policy, or derived from a trusted source. Similarly, a numeric quantity may be known to be range checked, calibrated, monotonic, hedged, normalised, or otherwise semantically constrained even though its ordinary machine type remains unchanged.
+
+Developers commonly encode such information informally in comments, naming conventions, call discipline, wrapper classes, assertions, or documentation. Static analysis tools may recover some of these facts automatically, but such analyses are generally specialised and are not always exposed as a general-purpose language abstraction. More expressive type systems can model many of these properties, but they may impose conceptual, syntactic, or proof burdens that inhibit adoption in large mainstream codebases.
+
+This paper proposes a language-level mechanism based on \emph{user-defined static property tags}. Conceptually, a programmer may write:
+
+\begin{lstlisting}
+establish x Validated;
+require   x Validated;
+\end{lstlisting}
+
+where \texttt{Validated} is a symbolic property that exists entirely at compile time. A checker propagates the property along value flows. Reassignment to a different value does not preserve the property unless justified; copying a value may preserve it; transformations may preserve, drop, or establish properties according to declared contracts; and control-flow joins retain only those facts guaranteed on all incoming paths.
+
+The central design principle is that tags attach to \emph{values and value provenance}, rather than merely to lexical variable names. The system therefore resembles a lightweight proof environment over an intermediate representation such as static single assignment (SSA) form.
+
+The proposal has four goals:
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{Low annotation burden.} Programmers should be able to introduce useful semantic facts without learning a full theorem prover or dependent type discipline.
+  \item \textbf{Flow sensitivity.} Properties should vary naturally across branches, loops, assignments, and calls.
+  \item \textbf{Interprocedural compositionality.} Functions should state what properties they require and establish.
+  \item \textbf{Compatibility with mainstream implementation practice.} The mechanism should be implementable as a front-end analysis, compiler plug-in, lint phase, or optional language extension.
+\end{enumerate}
+
+\section{Motivating Example}
+Consider data received from an untrusted source:
+
+\begin{lstlisting}
+String input = request.parameter("name");
+
+if (!validateName(input))
+    return error();
+
+establish input Validated;
+
+String escaped = sqlEscape(input);
+establish escaped SQLSafe;
+
+executeQuery(escaped);
+\end{lstlisting}
+
+A library contract might specify:
+
+\begin{lstlisting}
+function executeQuery(String q)
+    requires q SQLSafe;
+\end{lstlisting}
+
+The call is accepted only if the checker can prove that the actual argument carries \texttt{SQLSafe}. A later reassignment prevents accidental reuse of the earlier fact:
+
+\begin{lstlisting}
+establish input Validated;
+input = request.parameter("other");
+require input Validated;     // static error
+\end{lstlisting}
+
+The important distinction is that the identifier \texttt{input} has not permanently acquired the tag. Rather, one specific value denoted by \texttt{input} was established to have the property.
+
+\section{Core Model}
+
+\subsection{Property universe}
+Let $\mathcal{T}$ be a finite or countably extensible universe of symbolic tags. Tags are uninterpreted names at the core language level:
+\[
+\mathcal{T} = \{\textsf{Validated}, \textsf{SQLSafe}, \textsf{Authenticated}, \ldots\}.
+\]
+The core checker need not understand the domain meaning of a tag. It reasons only about property introduction, removal, flow, and contracts.
+
+\subsection{Three-valued knowledge}
+For each value $v$ and tag $t$, the checker tracks one of three knowledge states:
+\[
+K(v,t) \in \{\mathsf{Present},\mathsf{Absent},\mathsf{Unknown}\}.
+\]
+This distinction is essential. Failure to prove that a tag is present is not equivalent to proving that it is absent.
+
+For example:
+
+\begin{lstlisting}
+if (condition) {
+    establish x Trusted;
+}
+\end{lstlisting}
+
+After the branch, \texttt{Trusted(x)} is generally \emph{unknown}; neither its presence nor its absence is guaranteed.
+
+The knowledge domain for one tag can be represented as a small lattice in which conflicting path information joins to \textsf{Unknown}. An implementation may equivalently maintain two sets per abstract value: tags definitely present and tags definitely absent.
+
+\subsection{Program state}
+For exposition, let a static analysis state be
+\[
+\Sigma : V \to (P^+,P^-),
+\]
+where $V$ is the set of abstract values, $P^+ \subseteq \mathcal{T}$ contains definitely present tags, and $P^- \subseteq \mathcal{T}$ contains definitely absent tags, with $P^+ \cap P^- = \emptyset$.
+
+A requirement \texttt{require x T} succeeds iff $T \in P^+(x)$. A negative requirement \texttt{require x !T} succeeds iff $T \in P^-(x)$.
+
+\subsection{Join at control-flow merge points}
+At a merge point with predecessor states $\Sigma_1,\ldots,\Sigma_n$, only universally guaranteed facts survive:
+\[
+P^+_{\mathrm{join}}(v)=\bigcap_i P^+_i(v),
+\qquad
+P^-_{\mathrm{join}}(v)=\bigcap_i P^-_i(v).
+\]
+Thus the mechanism is intentionally conservative.
+
+\section{Proposed Surface Syntax}
+A minimal syntax could contain the following forms:
+
+\begin{lstlisting}
+establish x Validated;
+refute    x Tainted;
+require   x Validated SQLSafe;
+require   x !Tainted;
+forget    x Validated;
+assume    x Trusted;
+\end{lstlisting}
+
+The distinction between \texttt{establish} and \texttt{assume} is important. A language should avoid making an arbitrary programmer annotation appear equivalent to a proved property. Suggested meanings are:
+
+\begin{itemize}
+  \item \texttt{establish}: legal only at a checker-recognised proof point, validator success branch, compiler intrinsic, verified contract boundary, or other sanctioned mechanism;
+  \item \texttt{assume}: an explicit trust escape hatch analogous to an unchecked cast;
+  \item \texttt{require}: compile-time proof obligation;
+  \item \texttt{refute}: establish definite absence of a tag;
+  \item \texttt{forget}: deliberately discard information, useful around abstraction boundaries or mutation.
+\end{itemize}
+
+A simpler prototype could collapse \texttt{establish} and \texttt{assume} into a single \texttt{tag} operation while producing warnings or trust annotations.
+
+\section{Value Identity and SSA Interpretation}
+The semantics are clearest in SSA form. Consider:
+
+\begin{lstlisting}
+x = read();
+establish x Sanitized;
+y = x;
+x = read();
+\end{lstlisting}
+
+Conceptually the compiler may rewrite this as
+\begin{align*}
+x_1 &= \operatorname{read}(),\\
+&\textsf{Sanitized}(x_1),\\
+y_1 &= x_1,\\
+x_2 &= \operatorname{read}().
+\end{align*}
+Hence $y_1$ may inherit \textsf{Sanitized}, while $x_2$ does not. This value-centric interpretation eliminates a major class of ambiguities inherent in variable-centric tagging.
+
+\section{Transfer Functions}
+Each instruction induces a transfer function over the abstract property state.
+
+\subsection{Copy}
+For immutable scalar values or other copy-semantics values:
+\[
+y := x \implies P^+(y) \supseteq P^+(x), \quad P^-(y) \supseteq P^-(x).
+\]
+A conservative implementation may copy all properties unless individual tags are declared non-transferable.
+
+\subsection{Fresh assignment}
+If $x$ receives a newly computed value, properties attached to its previous value do not automatically transfer.
+
+\subsection{Pure transformations}
+For a function $f$, the checker may know a contract of the form
+\[
+\{T_1,\ldots,T_k\} \xrightarrow{f} \{U_1,\ldots,U_m\}.
+\]
+For example:
+
+\begin{lstlisting}
+contract sqlEscape(x)
+    ensures result SQLSafe;
+\end{lstlisting}
+
+or
+
+\begin{lstlisting}
+contract normalize(x)
+    preserves x Validated;
+    ensures result Normalized;
+\end{lstlisting}
+
+\subsection{Invalidating transformations}
+Some operations should explicitly invalidate properties:
+
+\begin{lstlisting}
+contract mutateBuffer(b)
+    invalidates b Parsed ChecksumVerified;
+\end{lstlisting}
+
+This is particularly important when a property depends on exact representation rather than abstract identity.
+
+\section{Function Contracts}
+Interprocedural verification is central to practical usefulness. We propose contracts such as:
+
+\begin{lstlisting}
+function sendPayment(Payment p)
+    requires p Validated Authorised;
+
+function verifyPayment(Payment p)
+    ensures p Validated;
+
+function authorise(Payment p, User u)
+    requires u Authenticated;
+    ensures p Authorised;
+\end{lstlisting}
+
+At a call site the checker verifies each precondition from the incoming abstract state and applies the callee's postcondition to the outgoing state. Unknown or unavailable bodies can still participate through interface contracts.
+
+This design supports separate compilation and allows libraries to expose semantic safety requirements without exposing implementations.
+
+\section{Path-Sensitive Establishment}
+Validation APIs often naturally refine program state by branch. For example:
+
+\begin{lstlisting}
+if (isValid(x)) {
+    establish x Validated;
+    consume(x);
+}
+\end{lstlisting}
+
+A more ergonomic system may allow the validator's contract itself to refine the true branch:
+
+\begin{lstlisting}
+function isValid(x)
+    returns true => ensures x Validated;
+    returns false => ensures x !Validated;
+\end{lstlisting}
+
+This resembles type narrowing in contemporary languages, but applies to arbitrary user-defined semantic properties.
+
+The following program is then rejected:
+
+\begin{lstlisting}
+if (isValid(x)) {
+    log("valid");
+}
+require x Validated;       // not true on all paths
+\end{lstlisting}
+
+whereas this program is accepted:
+
+\begin{lstlisting}
+if (!isValid(x))
+    return;
+
+require x Validated;       // proven
+\end{lstlisting}
+
+\section{Loops and Fixed-Point Analysis}
+Loops require conventional iterative data-flow analysis. The checker computes an invariant at the loop header as a fixed point. A property is guaranteed after a loop only if justified by the loop semantics and all exits.
+
+For example:
+
+\begin{lstlisting}
+while (moreChunks()) {
+    readChunk(buffer);
+    // validation of earlier contents may no longer be valid
+}
+require buffer Validated;
+\end{lstlisting}
+
+will generally fail unless the loop invariant or function contracts establish that \texttt{Validated} survives every iteration.
+
+An optional advanced syntax could permit programmer-supplied property invariants:
+
+\begin{lstlisting}
+while (condition)
+    invariant buffer BoundsChecked
+{
+    ...
+}
+\end{lstlisting}
+
+The checker would then verify preservation of the stated invariant.
+
+\section{Aliasing, Mutation, and Heap Objects}
+Aliasing is one of the principal difficulties in any serious implementation. If two references denote the same mutable object,
+
+\begin{lstlisting}
+a = object;
+b = a;
+establish a Validated;
+mutate(b);
+require a Validated;
+\end{lstlisting}
+
+then the final requirement is sound only if \texttt{mutate} is known to preserve \texttt{Validated}. Consequently, tags over mutable heap objects cannot be handled solely as lexical annotations.
+
+Several implementation strategies are possible:
+\begin{enumerate}
+  \item \textbf{Alias-sensitive invalidation.} Use points-to/alias analysis and invalidate affected properties on all may-alias references.
+  \item \textbf{Ownership integration.} Preserve stronger facts when an object is uniquely owned or borrowed immutably.
+  \item \textbf{Versioned heap abstractions.} Treat mutation as creating a new abstract object version, analogous to SSA for memory.
+  \item \textbf{Conservative forgetting.} Drop all representation-sensitive tags after unknown mutating calls.
+\end{enumerate}
+
+A production design may combine these approaches depending on compiler sophistication.
+
+\section{Tag Classes and Preservation Policies}
+Not all tags should propagate identically. We propose optional metadata describing tag behaviour.
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.25\linewidth} p{0.65\linewidth}}
+\toprule
+Tag class & Intended behaviour \\
+\midrule
+Value property & Follows immutable value copies; lost on recomputation. \\
+Representation property & Invalidated by representation-changing transformations. \\
+Object-state property & Associated with mutable object state and sensitive to aliasing. \\
+Capability property & May be affine or linear; copying can be restricted. \\
+Provenance property & Records source or construction history. \\
+Contextual property & Valid only relative to a parameter, principal, encoding, locale, or policy. \\
+\bottomrule
+\end{longtable}
+
+The core proposal can remain deliberately simpler, but these classes provide a path to richer semantics.
+
+\section{Parametric Tags}
+User-named boolean tags are useful but sometimes too coarse. A natural extension is parameterised tags:
+
+\begin{lstlisting}
+establish s EscapedFor(HTML);
+establish amount Range(0, 1000000);
+establish token AuthorisedFor(account42);
+establish buffer CheckedLength(n);
+\end{lstlisting}
+
+These approach refinement types, but a system may still treat parameters syntactically rather than invoke a general theorem prover. Equality, substitution, and a small set of built-in relations could deliver substantial value without exposing arbitrary logic.
+
+For security-sensitive programs, contextual parameterisation is particularly important. A string escaped for HTML is not necessarily safe for SQL; an authorisation for one resource should not silently generalise to another.
+
+\section{Derived and Hierarchical Tags}
+A tag relation may define implication:
+\[
+\textsf{CryptographicallyVerified} \Rightarrow \textsf{IntegrityChecked}.
+\]
+A declaration might be:
+
+\begin{lstlisting}
+tag CryptographicallyVerified implies IntegrityChecked;
+\end{lstlisting}
+
+The checker may then close the property set under declared implications. Care must be taken to avoid arbitrary rule systems that make analysis unpredictable or undecidable. Restricting implications to a finite acyclic relation yields a simple and useful feature.
+
+\section{Tag Transformers}
+Many functions systematically transform tags. Instead of enumerating contracts for every user tag, generic transformers could be declared.
+
+\begin{lstlisting}
+function identityLike<T>(T x)
+    preserves all value_tags(x);
+\end{lstlisting}
+
+More cautiously:
+
+\begin{lstlisting}
+function immutableCopy<T>(T x)
+    preserves tags classified ValueProperty;
+\end{lstlisting}
+
+A sanitiser may replace one tag by another:
+
+\begin{lstlisting}
+function sanitizeHtml(s)
+    consumes s UntrustedText;
+    ensures result HTMLSafe;
+\end{lstlisting}
+
+This makes the property system useful as an extensible data-flow protocol.
+
+\section{Negative Information}
+Negative tags require explicit semantics. \texttt{!Authenticated} should mean \emph{definitely not authenticated}, rather than merely \emph{not known to be authenticated}. This distinction prevents unsound reasoning from absence of evidence.
+
+For every tag $T$, the checker therefore distinguishes:
+\begin{align*}
+T(v) &\quad \text{proved},\\
+\neg T(v) &\quad \text{proved},\\
+?T(v) &\quad \text{unknown}.
+\end{align*}
+
+At a join between a path proving $T$ and a path proving $\neg T$, the result is unknown. A contradictory state containing both $T$ and $\neg T$ should be unreachable or reported as an internal inconsistency in annotations/contracts.
+
+\section{Trust Boundaries and Proof Sources}
+A static checker is only as meaningful as the mechanism by which facts enter the system. We distinguish several sources of property evidence:
+
+\begin{enumerate}
+  \item \textbf{Compiler-proven facts.} For example, a bounds check may permit the compiler to establish \texttt{InBounds}.
+  \item \textbf{Branch refinements.} A recognised predicate refines properties on true/false branches.
+  \item \textbf{Verified function contracts.} The callee body is checked against its declared postconditions.
+  \item \textbf{Externally trusted contracts.} Native code, libraries, generated code, or APIs may be annotated but not locally verified.
+  \item \textbf{Explicit assumptions.} The programmer intentionally bypasses proof.
+\end{enumerate}
+
+Compilers should make these categories visible. A diagnostic may say not merely that a property is present, but that it ultimately depends on an unchecked assumption at a particular source location.
+
+This supports a useful notion of a \emph{trust budget}: large systems can audit the relatively small set of assumption points while relying on automatic propagation elsewhere.
+
+\section{Diagnostics and Proof Traces}
+A practical checker should produce explanatory diagnostics. Instead of:
+
+\begin{lstlisting}
+error: missing tag Validated
+\end{lstlisting}
+
+it should report something closer to:
+
+\begin{lstlisting}
+error: cannot prove Validated(payment) here
+  property established at line 42 on branch condition verify(payment)
+  but control may reach this call through predecessor line 57
+  where payment was reassigned at line 53
+\end{lstlisting}
+
+Optionally, the compiler could expose a compact proof trace describing how each required tag was established. This would substantially improve usability and make the system attractive as a code-review aid.
+
+\section{Relationship to Existing Techniques}
+The proposal overlaps with several established ideas but occupies a distinct pragmatic design point.
+
+\subsection{Taint analysis}
+Taint systems propagate security labels such as \emph{untrusted} and \emph{sanitised}. User-defined static tags generalise this idea to arbitrary domain facts rather than a predefined security lattice. A sufficiently expressive taint framework can encode much of the proposal, but mainstream languages rarely expose taint tracking as a universal first-class semantic annotation system.
+
+\subsection{Typestate}
+Typestate associates legal operations with an object's abstract state, such as \texttt{Open} versus \texttt{Closed}. Static tags can encode typestate but are more orthogonal: a value may simultaneously possess many independent properties rather than inhabit one enumerated protocol state.
+
+\subsection{Refinement types}
+A refinement type may express a predicate such as
+\[
+\{x:\mathbb{Z}\mid x>0\}.
+\]
+Property tags can be viewed as named, opaque refinements whose proof rules are explicitly supplied by data-flow events and contracts. This is less expressive but potentially easier to adopt and cheaper to analyse.
+
+\subsection{Dependent types}
+Dependent type systems allow types to depend on values and can encode rich invariants with explicit or synthesised proofs. The present proposal deliberately separates ordinary machine-level type from lightweight semantic knowledge. One might regard it as a restricted proof-carrying layer in which propositions are user-named atoms and proof composition is primarily data-flow propagation.
+
+\subsection{Effect systems}
+Effect systems annotate expressions or functions with computational effects. Property tags concern facts about values, but the machinery is complementary. A language might track both function effects and value properties within a unified static contract framework.
+
+\subsection{Abstract interpretation}
+From an implementation perspective, the checker is naturally described as an abstract interpretation over a finite property domain. The distinctive language-design contribution is to expose the abstract domain to users through extensible symbolic properties and source-level proof obligations.
+
+\section{Comparison with Wrapper Types}
+Many teams encode semantic state with wrapper types:
+
+\begin{lstlisting}
+class ValidatedString { String value; }
+class SqlSafeString  { String value; }
+\end{lstlisting}
+
+This is often effective, but has limitations. It may create allocation or representation concerns, wrapper proliferation, cumbersome conversions, and difficulty representing multiple orthogonal facts. Tags allow:
+
+\begin{lstlisting}
+String s;   // ordinary representation
+// statically known: Validated, Normalized, SQLSafe
+\end{lstlisting}
+
+without synthesising a combinatorial family of wrapper types. Conversely, wrapper types provide stronger nominal abstraction and may be preferable when semantic states correspond to genuinely distinct APIs. The two mechanisms are complementary.
+
+\section{Security Applications}
+The proposal is particularly well suited to security-relevant flow constraints:
+\begin{itemize}
+  \item untrusted versus validated input;
+  \item authentication and authorisation state;
+  \item context-specific escaping;
+  \item signature verification;
+  \item cryptographic key provenance;
+  \item secrets that must not reach logging sinks;
+  \item declassification and endorsement boundaries;
+  \item deserialised objects whose invariants have been checked.
+\end{itemize}
+
+A security policy could require:
+
+\begin{lstlisting}
+function log(x)
+    requires x !Secret;
+\end{lstlisting}
+
+or, more safely, use an information-flow lattice in an advanced extension.
+
+\section{Numerical and Scientific Applications}
+The same mechanism is useful outside security. Examples include:
+
+\begin{lstlisting}
+establish matrix Symmetric;
+establish matrix PositiveDefinite;
+establish portfolio DeltaNeutral;
+establish vector Normalized;
+establish timestamp Monotonic;
+establish quantity UnitChecked;
+establish mesh ManifoldChecked;
+\end{lstlisting}
+
+A numerical routine could state:
+
+\begin{lstlisting}
+function cholesky(A)
+    requires A Symmetric PositiveDefinite;
+\end{lstlisting}
+
+or a market-risk routine:
+
+\begin{lstlisting}
+function publishHedgeBook(book)
+    requires book DeltaNeutral RiskLimitsChecked;
+\end{lstlisting}
+
+These tags need not prove the underlying mathematics themselves. Rather, they record that designated verification stages have occurred and prevent subsequent code from accidentally bypassing them.
+
+\section{Temporal and Protocol Applications}
+Tags can record protocol milestones:
+
+\begin{lstlisting}
+establish socket Connected;
+establish message Parsed;
+establish request Authenticated;
+establish transaction Committed;
+\end{lstlisting}
+
+Unlike classical typestate, independent properties may coexist. This is convenient for systems in which state is not naturally a single finite-state machine.
+
+\section{Capability-Like and Linear Tags}
+An extension could permit tags whose duplication is restricted. For example:
+
+\begin{lstlisting}
+establish token HasWriteCapability(resource42);
+\end{lstlisting}
+
+If the capability tag is declared \emph{linear}, copying the underlying value would not duplicate authority. Instead the property would move from source to destination. This connects the proposal to affine and linear type systems and could support resource ownership, single-use tokens, and lifecycle protocols.
+
+This feature should be considered an optional extension because it changes the simple set-propagation semantics of ordinary tags.
+
+\section{Soundness Considerations}
+A core soundness theorem can be stated informally as follows.
+
+\begin{property}[Static requirement soundness]
+Assume that all tag-introducing primitives and function contracts are semantically valid, that the analysis soundly over-approximates control flow and aliasing, and that no unchecked assumption is used. If the checker accepts \texttt{require x T} at program point $p$, then every concrete execution reaching $p$ satisfies the semantic predicate associated with $T$ for the runtime value denoted by $x$.
+\end{property}
+
+The theorem deliberately depends on the validity of primitive tag introduction and contracts. Opaque tags do not by themselves create truth; they create a tractable framework for transporting established truth.
+
+Unchecked \texttt{assume} operations should therefore be treated similarly to unsafe casts, foreign-function interfaces, or proof axioms: useful but explicitly visible.
+
+\section{Completeness and False Positives}
+The proposed analysis is not expected to be complete. A property may hold at runtime even when the checker cannot prove it. Conservative rejection is preferable to unsound acceptance for safety-oriented uses.
+
+Developers can resolve false positives through:
+\begin{itemize}
+  \item stronger function contracts;
+  \item explicit branch refinements;
+  \item loop invariants;
+  \item local restructuring;
+  \item trusted assumptions where justified;
+  \item advanced analysers that infer more preservation facts.
+\end{itemize}
+
+The design should avoid turning every rejected proof obligation into a demand for complex theorem proving.
+
+\section{Gradual Adoption}
+A major advantage of opaque symbolic tags is that they can be introduced gradually. Existing code remains valid until a new \texttt{require} or contract is added. A possible adoption sequence is:
+
+\begin{enumerate}
+  \item annotate critical sink functions with requirements;
+  \item annotate existing validators with postconditions;
+  \item run the checker and identify unproved flows;
+  \item add missing contracts or explicit assumptions at legacy boundaries;
+  \item progressively reduce assumption points.
+\end{enumerate}
+
+This resembles the successful adoption patterns of nullability annotations, static taint checking, and gradual typing.
+
+\section{Implementation Strategy}
+A prototype could be implemented as a compiler or linter phase using standard data-flow infrastructure.
+
+\subsection{Front-end representation}
+The source compiler lowers code to a control-flow graph, preferably SSA. Each SSA value is associated with an abstract property environment.
+
+\subsection{Worklist algorithm}
+For each basic block, the checker maintains an input and output abstract state. Transfer functions process statements; predecessor states are joined by intersection of definite positive and negative facts. A standard worklist iterates until no state changes.
+
+If the tag universe present in a compilation unit is finite, termination is immediate because the lattice has finite height.
+
+\subsection{Interprocedural analysis}
+The simplest implementation trusts declared contracts. A stronger implementation verifies function bodies against \texttt{ensures} clauses and computes summaries for unannotated functions. Whole-program or modular summary inference may reduce annotation burden.
+
+\subsection{Aliasing}
+For pointer-rich languages, the checker can reuse existing alias, escape, ownership, or memory-SSA infrastructure. A deliberately conservative first prototype may invalidate all object-state properties after unknown impure calls.
+
+\subsection{Runtime cost}
+The basic system has zero runtime cost: tags and requirements are erased after compilation. Optional debug builds may translate selected requirements into runtime assertions, but this is not necessary to the design.
+
+\section{A Compact Formalisation}
+Let a statement transform abstract state $\Sigma$ to $F_s(\Sigma)$. Representative rules are:
+
+\paragraph{Establish.}
+\[
+F_{\mathrm{establish}(v,t)}(\Sigma):
+\quad t \in P^+(v),\; t \notin P^-(v).
+\]
+
+\paragraph{Refute.}
+\[
+F_{\mathrm{refute}(v,t)}(\Sigma):
+\quad t \in P^-(v),\; t \notin P^+(v).
+\]
+
+\paragraph{Forget.}
+\[
+F_{\mathrm{forget}(v,t)}(\Sigma):
+\quad t \notin P^+(v),\; t \notin P^-(v).
+\]
+
+\paragraph{Require.}
+\[
+\Sigma \vdash \mathrm{require}(v,t)
+\quad\text{iff}\quad t \in P^+(v).
+\]
+
+\paragraph{Negative require.}
+\[
+\Sigma \vdash \mathrm{require}(v,!t)
+\quad\text{iff}\quad t \in P^-(v).
+\]
+
+\paragraph{Join.}
+For predecessor states $\Sigma_1$ and $\Sigma_2$:
+\[
+\operatorname{join}(P_1^+,P_2^+) = P_1^+ \cap P_2^+,
+\qquad
+\operatorname{join}(P_1^-,P_2^-) = P_1^- \cap P_2^-.
+\]
+
+This minimal semantics already provides useful correctness checking.
+
+\section{Example: Authentication Protocol}
+Consider:
+
+\begin{lstlisting}
+Request r = receive();
+
+if (!verifySignature(r))
+    reject();
+// Contract refines success continuation:
+// r has SignatureVerified
+
+User u = lookupUser(r);
+
+if (!authenticate(u, r.credentials))
+    reject();
+// u has Authenticated
+
+Payment p = parsePayment(r);
+require r SignatureVerified;
+
+if (!authorise(u, p))
+    reject();
+// p has AuthorisedFor(u)
+
+submit(p);
+\end{lstlisting}
+
+with contracts:
+
+\begin{lstlisting}
+function submit(p)
+    requires p Authorised;
+    requires p Validated;
+\end{lstlisting}
+
+The checker enforces that code cannot accidentally bypass one of the protocol phases even when functions are reorganised or control flow becomes complex.
+
+\section{Example: Representation-Sensitive Validation}
+Suppose a compressed payload is validated before decompression:
+
+\begin{lstlisting}
+Blob compressed = receive();
+validateContainer(compressed);
+establish compressed ContainerValid;
+
+Blob plain = decompress(compressed);
+require plain ContainerValid;  // rejected
+\end{lstlisting}
+
+The rejection forces a semantic question that is easy to miss during ordinary code review: does validity of the container imply validity of the decompressed content? Usually it does not. The correct design might instead specify:
+
+\begin{lstlisting}
+contract decompress(x)
+    requires x ContainerValid;
+    ensures result Decompressed;
+\end{lstlisting}
+
+followed by a separate content validation phase.
+
+\section{Example: Financial Correctness Workflow}
+A static property system can encode workflow invariants in quantitative software:
+
+\begin{lstlisting}
+Book b = loadTrades();
+reconcile(b);
+establish b Reconciled;
+
+computeGreeks(b);
+establish b GreeksCurrent;
+
+hedge(b);
+establish b DeltaNeutral;
+
+publishRisk(b);
+\end{lstlisting}
+
+where:
+
+\begin{lstlisting}
+function publishRisk(Book b)
+    requires b Reconciled GreeksCurrent DeltaNeutral;
+\end{lstlisting}
+
+If a later mutation inserts a trade after hedging, contracts can invalidate \texttt{GreeksCurrent} and \texttt{DeltaNeutral}, statically preventing stale state from being published.
+
+\section{Automatic Tag Inference}
+Although user-defined tags are intentionally opaque, a compiler can infer some tag changes from recognised constructs. Examples include:
+\begin{itemize}
+  \item bounds checks establishing \texttt{InBounds};
+  \item null tests establishing \texttt{NonNull};
+  \item lock acquisition establishing \texttt{LockHeld(L)};
+  \item successful parse operations establishing \texttt{Parsed};
+  \item enum discrimination establishing variant-specific facts;
+  \item ownership operations establishing uniqueness properties.
+\end{itemize}
+
+A plugin architecture could allow domain-specific analysers to contribute proof rules while keeping the core language simple.
+
+\section{Proof-Carrying Validators}
+A deeper extension replaces an imperative tag-introduction statement with validators that return a proof token:
+
+\begin{lstlisting}
+Proof<Validated(x)> p = validate(x);
+\end{lstlisting}
+
+The compiler may erase the token at runtime. This begins to resemble dependent typing, but a mainstream language could hide most proof syntax and allow the result merely to refine tags. Such proof objects would make trust dependencies explicit and might enable verified libraries to interoperate with the lightweight tag layer.
+
+\section{Tag Scope and Revocation}
+Some facts are valid only during a lexical or dynamic scope. For example, a lock is held only within a region:
+
+\begin{lstlisting}
+with lock(m) {
+    // m has LockHeld
+    require m LockHeld;
+}
+// LockHeld no longer available
+\end{lstlisting}
+
+Scoped tags are useful for locks, transactions, temporary pinning, privilege elevation, borrowed views, and read-consistency snapshots. The language can model scope exit as automatic invalidation.
+
+\section{Concurrency}
+Concurrency complicates object-state tags. If another thread may mutate an object, properties established by one thread can become stale. A sound design requires one or more of:
+\begin{itemize}
+  \item immutability;
+  \item thread confinement;
+  \item ownership or race-freedom guarantees;
+  \item lock-conditioned properties such as \texttt{ValidUnder(lock)};
+  \item conservative invalidation at concurrency boundaries.
+\end{itemize}
+
+This suggests a productive integration with race detectors, ownership systems, or effect annotations.
+
+\section{Exceptions and Non-Local Control Flow}
+Property propagation must follow all exceptional exits. If a function establishes a tag only after an operation that can throw, the fact is available only on normal continuation. Finally blocks, destructors, cancellation, and asynchronous control flow require ordinary CFG treatment.
+
+The mechanism itself introduces no fundamentally new problem; it inherits the compiler's control-flow model.
+
+\section{Generics and Polymorphism}
+A useful extension is property polymorphism. Consider an identity function:
+
+\begin{lstlisting}
+T id<T>(T x)
+    preserves value_properties(x);
+\end{lstlisting}
+
+or a container mapper that preserves element properties only when the mapping function does:
+
+\begin{lstlisting}
+map(xs, f)
+    propagates ElementTag(P)
+    if f preserves P;
+\end{lstlisting}
+
+Such features should be introduced cautiously. Even a non-polymorphic first version offers substantial value.
+
+\section{Design Principle: Keep the Logic Small}
+The primary risk is uncontrolled evolution into a theorem-proving language. The proposed system is most attractive if its default fragment remains predictable:
+
+\begin{itemize}
+  \item finite user-defined atomic tags;
+  \item three-valued knowledge;
+  \item flow-sensitive propagation;
+  \item explicit contracts;
+  \item finite implication relations;
+  \item conservative invalidation under unknown mutation.
+\end{itemize}
+
+Richer refinements, arithmetic predicates, SMT solving, linear capabilities, and proof terms can exist as optional layers rather than prerequisites.
+
+\section{Potential Syntax in a Mainstream Language}
+One Java-like design might use annotations and compiler intrinsics:
+
+\begin{lstlisting}
+@Requires("Validated", "Authorised")
+void submit(Payment p) { ... }
+
+@Ensures(param="p", tag="Validated")
+boolean validate(Payment p) { ... }
+
+if (!validate(p)) return;
+Static.require(p, "Validated");
+\end{lstlisting}
+
+A language with first-class syntax could be cleaner:
+
+\begin{lstlisting}
+fn submit(p: Payment)
+    requires p: Validated + Authorised
+{
+    ...
+}
+
+fn validate(p: Payment) -> bool
+    true => ensures p: Validated
+{
+    ...
+}
+\end{lstlisting}
+
+For backward compatibility, an implementation could initially support the feature entirely through attributes and a compiler plug-in.
+
+\section{Research Questions}
+The proposal suggests several empirical and theoretical research questions:
+
+\begin{enumerate}
+  \item How much annotation is required to obtain useful guarantees in large legacy codebases?
+  \item Which default preservation rules minimise both false positives and unsound intuition?
+  \item Can useful contracts be inferred automatically from common validator patterns?
+  \item How should tags interact with aliasing, ownership, and concurrency?
+  \item Are developers able to understand three-valued property states and proof diagnostics without specialist training?
+  \item Does the mechanism reduce classes of real defects compared with wrapper types, assertions, or conventional linters?
+  \item What is the optimal boundary between opaque tags and parameterised/refinement-like properties?
+  \item Can assumption provenance be surfaced effectively enough to support security audits and certification?
+\end{enumerate}
+
+\section{Prototype Evaluation Plan}
+A reasonable prototype study could proceed as follows:
+
+\begin{enumerate}
+  \item Implement an analyser over a mainstream language IR such as LLVM, Java bytecode/AST, Roslyn C\#, or Clang C++.
+  \item Support atomic positive/negative tags, branch refinement, requirements, and function contracts.
+  \item Evaluate on three domains: input validation/security, protocol/stateful APIs, and numerical/financial workflows.
+  \item Measure annotation density, false-positive rate, compile-time overhead, and defects detected.
+  \item Compare against wrapper-type refactorings and dedicated taint analysers.
+  \item Conduct a developer study focused on diagnostic comprehensibility and perceived burden.
+\end{enumerate}
+
+\section{Limitations}
+The mechanism does not eliminate the need for testing, runtime validation, formal verification, or domain reasoning. Opaque tags can record that a validation step occurred, but a buggy validator can establish a false belief. Incorrect contracts can likewise compromise guarantees. Aliasing and concurrency may force conservative information loss. Furthermore, properties requiring nontrivial arithmetic or relational reasoning are only indirectly representable unless the system is extended toward refinement types or SMT-backed verification.
+
+Nevertheless, these limitations are shared in various forms by most practical static-analysis systems. The value proposition is not complete program verification, but a low-friction way to make semantic correctness obligations explicit and machine-checkable.
+
+\section{Conclusion}
+User-defined static property tags provide a plausible lightweight verification layer for mainstream programming languages. They generalise familiar ideas from type narrowing and taint analysis into an extensible mechanism for recording semantic facts about values. The essential design is simple: tags are introduced at justified proof points, propagated by flow-sensitive analysis, invalidated by transformations that may destroy their meaning, and demanded by compile-time requirements and function contracts.
+
+The proposal occupies a useful middle ground. Ordinary type systems often cannot express whether a value has been validated, authorised, normalised, reconciled, range checked, cryptographically verified, or otherwise processed according to a semantic protocol. Full refinement or dependent type systems can express substantially more, but at greater conceptual and implementation cost. Static property tags intentionally trade expressive completeness for predictable data-flow reasoning and gradual adoption.
+
+The most important engineering questions concern value identity, aliasing, mutation, interprocedural preservation, trust boundaries, and diagnostic quality. These problems are tractable using established compiler techniques such as SSA, abstract interpretation, points-to analysis, function summaries, and fixed-point data-flow algorithms. With careful language design, the feature could provide many of the practical correctness benefits associated with richer type systems while remaining intelligible to programmers accustomed to conventional mainstream languages.
+
+In this sense, the proposed mechanism can be understood as a lightweight, programmer-extensible layer of atomic propositions over program values: a restricted proof system whose proofs are largely supplied by control flow, provenance, and contracts rather than by explicit theorem construction. That restrictedness may be its principal strength.
+
+\section*{Suggested Related Literature}
+The proposal is conceptually connected to a substantial body of existing work. A future publication should position it carefully with respect to refinement types, typestate, effect systems, abstract interpretation, security-typed languages, taint analysis, liquid types, gradual typing, ownership and linear types, and dependent types. Canonical starting points include work by Cousot and Cousot on abstract interpretation, Strom and Yemini on typestate, Freeman and Pfenning on refinement types, and later work on Liquid Types and practical refinement checking. Exact bibliographic references should be selected and verified for the target venue.
+
+\end{document}

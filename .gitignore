@@ -1,0 +1,29 @@
+# Native build trees, executables and Python caches
+**/build*/
+**/target/
+__pycache__/
+*.pyc
+*.exe
+*.obj
+*.o
+*.pdb
+
+# Local editor state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# LaTeX intermediate output; curated paper PDFs are versioned
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
