@@ -29,6 +29,7 @@ verifies their use, not their truth. Unknown calls and writes conservatively
 erase evidence; unsupported operations reject the check. The implementation is
 a useful bounded frontend, not a soundness claim for arbitrary C++.
 
+- [Start here: installation and your first checked project](GETTING_STARTED.md)
 - [Design, philosophy, plan and semantic boundaries](DESIGN.md)
 - [Build, API and integration instructions](USAGE.md)
 - [Showcase application](example-app/README.md)
@@ -123,13 +124,13 @@ ignored; source, configuration, documentation and curated PDFs belong in Git.
 ## Papers and background
 
 - [ClangSOLV paper](docs/papers/clangsolv.pdf)
-  · [LaTeX](docs/papers/clangsolv.tex)
+  Â· [LaTeX](docs/papers/clangsolv.tex)
 - [Comprehensive synthesis: ideas, JSOLV and ClangSOLV](docs/papers/static_object_labelling.pdf)
-  · [LaTeX](docs/papers/static_object_labelling.tex)
+  Â· [LaTeX](docs/papers/static_object_labelling.tex)
 - [Original static-property proposal](docs/papers/static_property_tags.pdf)
-  · [LaTeX](docs/papers/static_property_tags.tex)
+  Â· [LaTeX](docs/papers/static_property_tags.tex)
 - [Original semantic-category proposal](docs/papers/semantic_roles_beyond_class.pdf)
-  · [LaTeX](docs/papers/semantic_roles_beyond_class.tex)
+  Â· [LaTeX](docs/papers/semantic_roles_beyond_class.tex)
 - [Paper collection and companion implementations](docs/papers/README.md)
 
 The papers also discuss JSOLV's Java annotations and CSOLV's portable template

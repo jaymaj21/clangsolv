@@ -1,5 +1,7 @@
 # Building and using ClangSOLV
 
+New to the tool? Start with [the installation and first-project guide](GETTING_STARTED.md).
+
 ## Build the checker
 
 Install matching LLVM and Clang **development** packages, including AST,
